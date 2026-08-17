@@ -1,479 +1,304 @@
-import streamlit as st
+"""Two-Round Rock-Paper-Scissors Vision Game.
+
+Live webcam game: Streamlit UI + streamlit-webrtc video pipeline,
+MediaPipe HandLandmarker for hand gesture detection, OpenCV for the
+skeleton overlay and on-frame drawing.
+
+Deploy on Streamlit Community Cloud
+-----------------------------------
+1. Commit app.py, hand_landmarker.task, requirements.txt and packages.txt.
+2. In Streamlit Cloud, create a new app from the GitHub repo and choose a
+   Python version >= 3.10 (3.11 or 3.12 recommended).
+3. packages.txt installs the apt libraries (libGL, glib, libgomp, ...) that
+   OpenCV/MediaPipe need on the Linux runtime, so no system-dependency
+   errors occur.
+4. If hand_landmarker.task is not committed to the repo, the app downloads
+   it automatically on first run, so the repo works either way.
+"""
+
+import math
+import os
+import threading
+import time
+import urllib.request
+
+import av
 import cv2
 import mediapipe as mp
-import av
+import streamlit as st
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
-from streamlit_webrtc import (
-    webrtc_streamer,
-    WebRtcMode,
-    RTCConfiguration
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
 )
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+
+# STUN server so the WebRTC connection works on mobile networks / NATs.
+RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+
+# Low-ish resolution + front camera: fast on mobile and on Cloud CPUs.
+MEDIA_STREAM_CONSTRAINTS = {
+    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "facingMode": "user"},
+    "audio": False,
+}
+
+MAX_PROCESS_WIDTH = 640  # frames are downscaled to this width before inference
+EXTEND_ANGLE = 155.0     # min angle (deg) at the PIP joint for a finger to count as extended
+
+BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+VALID_GESTURES = frozenset(BEATS)
+GESTURE_LABEL = {"rock": "Rock", "paper": "Paper", "scissors": "Scissors"}
+GESTURE_EMOJI = {"rock": "✊", "paper": "✋", "scissors": "✌️"}
+
+HAND_CONNECTIONS = vision.HandLandmarksConnections.HAND_CONNECTIONS
+
+WRIST, THUMB_IP, THUMB_TIP = 0, 3, 4
+INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
+MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
+RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
+PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
 
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="Two-Round RPS Vision Game",
-    page_icon="✋",
-    layout="centered"
-)
-
-
-# ============================================================
-# TITLE
-# ============================================================
-
-st.title("🤖 Two-Round RPS Vision Game")
-
-st.write(
-    "Play two consecutive rounds of Rock-Paper-Scissors "
-    "using computer vision."
-)
+def angle_at(a, b, c):
+    """Angle in degrees at vertex b formed by segments b->a and b->c."""
+    v1 = (a.x - b.x, a.y - b.y)
+    v2 = (c.x - b.x, c.y - b.y)
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    n1 = math.hypot(v1[0], v1[1])
+    n2 = math.hypot(v2[0], v2[1])
+    if n1 == 0.0 or n2 == 0.0:
+        return 0.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot / (n1 * n2)))))
 
 
-# ============================================================
-# MEDIAPIPE INITIALIZATION
-# ============================================================
+def classify_gesture(landmarks, handedness):
+    """Classify the 21 hand landmarks into rock / paper / scissors (or None)."""
+    index_open = angle_at(landmarks[INDEX_MCP], landmarks[INDEX_PIP], landmarks[INDEX_TIP]) > EXTEND_ANGLE
+    middle_open = angle_at(landmarks[MIDDLE_MCP], landmarks[MIDDLE_PIP], landmarks[MIDDLE_TIP]) > EXTEND_ANGLE
+    ring_open = angle_at(landmarks[RING_MCP], landmarks[RING_PIP], landmarks[RING_TIP]) > EXTEND_ANGLE
+    pinky_open = angle_at(landmarks[PINKY_MCP], landmarks[PINKY_PIP], landmarks[PINKY_TIP]) > EXTEND_ANGLE
 
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+    if handedness == "Left":
+        thumb_open = landmarks[THUMB_TIP].x > landmarks[THUMB_IP].x
+    else:
+        thumb_open = landmarks[THUMB_TIP].x < landmarks[THUMB_IP].x
 
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
+    if not (index_open or middle_open or ring_open or pinky_open or thumb_open):
+        return "rock"
+    if index_open and middle_open and ring_open and pinky_open and thumb_open:
+        return "paper"
+    if index_open and middle_open and not ring_open and not pinky_open and not thumb_open:
+        return "scissors"
+    return None
 
 
-# ============================================================
-# GESTURE CLASSIFICATION
-# ============================================================
+def draw_skeleton(img, landmarks):
+    """Overlay the hand skeleton (connections + joints) on the frame."""
+    h, w = img.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(img, pts[a], pts[b], (0, 255, 150), 2, cv2.LINE_AA)
+    for px, py in pts:
+        cv2.circle(img, (px, py), 4, (0, 200, 255), -1, cv2.LINE_AA)
 
-def classify_gesture(frame):
 
-    # Convert BGR to RGB
-    rgb_frame = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
+def draw_banner(img, gesture, hand_present):
+    """Draw the current detection status at the top of the frame."""
+    if gesture:
+        text, color = f"Gesture: {GESTURE_LABEL[gesture]}", (0, 200, 0)
+    elif hand_present:
+        text, color = "Show Rock / Paper / Scissors", (0, 165, 255)
+    else:
+        text, color = "No hand detected", (120, 120, 120)
+    cv2.rectangle(img, (0, 0), (img.shape[1], 52), (20, 20, 20), -1)
+    cv2.putText(img, text, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
+
+
+def ensure_model():
+    """Return the local model path, downloading it on first use if needed."""
+    if os.path.exists(MODEL_PATH):
+        return MODEL_PATH
+    tmp = f"{MODEL_PATH}.part"
+    urllib.request.urlretrieve(MODEL_URL, tmp)
+    os.replace(tmp, MODEL_PATH)
+    return MODEL_PATH
+
+
+def create_landmarker():
+    base_options = python.BaseOptions(
+        model_asset_path=ensure_model(), delegate=python.BaseOptions.Delegate.CPU
     )
-
-    # Process frame with MediaPipe
-    results = hands.process(rgb_frame)
-
-    gesture = "Unknown"
-
-    alert = (
-        "⚠️ No hand detected! "
-        "Please show your hand to the camera."
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
-
-    # ========================================================
-    # HAND DETECTED
-    # ========================================================
-
-    if results.multi_hand_landmarks:
-
-        alert = ""
-
-        for hand_landmarks in results.multi_hand_landmarks:
-
-            # Draw hand skeleton
-            mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS
-            )
-
-            landmarks = hand_landmarks.landmark
-
-            # =================================================
-            # FINGER DETECTION
-            # =================================================
-
-            fingers = []
-
-            # -------------------------------------------------
-            # Thumb
-            # -------------------------------------------------
-
-            if landmarks[4].x < landmarks[3].x:
-                fingers.append(1)
-            else:
-                fingers.append(0)
-
-            # -------------------------------------------------
-            # Other four fingers
-            # -------------------------------------------------
-
-            finger_tips = [8, 12, 16, 20]
-            finger_pips = [6, 10, 14, 18]
-
-            for tip, pip in zip(
-                finger_tips,
-                finger_pips
-            ):
-
-                if landmarks[tip].y < landmarks[pip].y:
-                    fingers.append(1)
-                else:
-                    fingers.append(0)
-
-            total_fingers = sum(fingers)
-
-            # =================================================
-            # ROCK
-            # =================================================
-
-            if total_fingers == 0 or total_fingers == 1:
-
-                gesture = "Rock"
-
-            # =================================================
-            # SCISSORS
-            # =================================================
-
-            elif (
-                total_fingers == 2
-                and fingers[1] == 1
-                and fingers[2] == 1
-            ):
-
-                gesture = "Scissors"
-
-            # =================================================
-            # PAPER
-            # =================================================
-
-            elif total_fingers == 5:
-
-                gesture = "Paper"
-
-            # =================================================
-            # INVALID
-            # =================================================
-
-            else:
-
-                gesture = "Invalid"
-
-                alert = (
-                    "⚠️ Invalid gesture! "
-                    "Please clearly show Rock, Paper, or Scissors."
-                )
-
-    return frame, gesture, alert
+    return vision.HandLandmarker.create_from_options(options)
 
 
-# ============================================================
-# WEBRTC VIDEO PROCESSOR
-# ============================================================
-
-class VideoProcessor:
+class RPSVideoProcessor(VideoProcessorBase):
+    """Per-frame video processor: landmarks -> gesture -> annotated frame."""
 
     def __init__(self):
+        self._landmarker = create_landmarker()
+        self._lock = threading.Lock()
+        self._last_ts_ms = 0
+        self.latest_gesture = None
+        self.hand_present = False
 
-        self.gesture = "Unknown"
+    def _next_ts_ms(self):
+        ts = int(time.time() * 1000)
+        if ts <= self._last_ts_ms:
+            ts = self._last_ts_ms + 1
+        self._last_ts_ms = ts
+        return ts
 
-        self.alert = (
-            "⚠️ No hand detected! "
-            "Please show your hand to the camera."
-        )
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)  # mirror view, like a selfie camera
 
-    def recv(self, frame):
+        h, w = img.shape[:2]
+        scale = min(1.0, MAX_PROCESS_WIDTH / w)
+        if scale < 1.0:
+            img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
-        # Convert WebRTC frame to OpenCV image
-        img = frame.to_ndarray(
-            format="bgr24"
-        )
-
-        # Analyze gesture
-        processed_img, gesture, alert = (
-            classify_gesture(img)
-        )
-
-        # Save latest detection
-        self.gesture = gesture
-        self.alert = alert
-
-        # Return processed video frame
-        return av.VideoFrame.from_ndarray(
-            processed_img,
-            format="bgr24"
-        )
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "game_state" not in st.session_state:
-
-    st.session_state.game_state = "Round 1"
-
-
-if "round_1_choice" not in st.session_state:
-
-    st.session_state.round_1_choice = None
-
-
-if "round_2_choice" not in st.session_state:
-
-    st.session_state.round_2_choice = None
-
-
-# ============================================================
-# GAME STATUS
-# ============================================================
-
-st.subheader(
-    f"Status: {st.session_state.game_state}"
-)
-
-
-# ============================================================
-# GAME ROUNDS
-# ============================================================
-
-if st.session_state.game_state in [
-    "Round 1",
-    "Round 2"
-]:
-
-    st.info(
-        f"Show your hand for "
-        f"**{st.session_state.game_state}**."
-    )
-
-    # ========================================================
-    # WEBRTC CONFIGURATION
-    # ========================================================
-
-    rtc_config = RTCConfiguration(
-        {
-            "iceServers": [
-                {
-                    "urls": [
-                        "stun:stun.l.google.com:19302"
-                    ]
-                }
-            ]
-        }
-    )
-
-    # ========================================================
-    # START CAMERA
-    # ========================================================
-
-    ctx = webrtc_streamer(
-        key="rps-stream",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=rtc_config,
-        video_processor_factory=VideoProcessor,
-        media_stream_constraints={
-            "video": True,
-            "audio": False
-        },
-        video_html_attrs={
-            "playsinline": True,
-            "muted": True,
-            "controls": False
-        }
-    )
-
-    # ========================================================
-    # SHOW DETECTION
-    # ========================================================
-
-    if ctx.video_processor:
-
-        current_gesture = (
-            ctx.video_processor.gesture
-        )
-
-        alert_msg = (
-            ctx.video_processor.alert
-        )
-
-        # ----------------------------------------------------
-        # Valid gesture
-        # ----------------------------------------------------
-
-        if current_gesture in [
-            "Rock",
-            "Paper",
-            "Scissors"
-        ]:
-
-            st.success(
-                f"Detected Gesture: "
-                f"**{current_gesture}**"
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        with self._lock:
+            result = self._landmarker.detect_for_video(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), self._next_ts_ms()
             )
 
-        # ----------------------------------------------------
-        # Invalid gesture
-        # ----------------------------------------------------
+        gesture = None
+        hand_present = bool(result.hand_landmarks)
+        if result.hand_landmarks:
+            landmarks = result.hand_landmarks[0]
+            handedness = result.handedness[0][0].category_name
+            gesture = classify_gesture(landmarks, handedness)
+            draw_skeleton(img, landmarks)
 
-        elif current_gesture == "Invalid":
+        self.latest_gesture = gesture
+        self.hand_present = hand_present
+        draw_banner(img, gesture, hand_present)
 
-            st.warning(alert_msg)
-
-        # ----------------------------------------------------
-        # No hand
-        # ----------------------------------------------------
-
-        else:
-
-            st.error(alert_msg)
-
-        # ====================================================
-        # LOCK GESTURE
-        # ====================================================
-
-        if st.button(
-            "🔒 Lock Input Gesture",
-            use_container_width=True
-        ):
-
-            if current_gesture in [
-                "Unknown",
-                "Invalid"
-            ]:
-
-                st.warning(
-                    "Cannot lock input! "
-                    "Please show a valid gesture."
-                )
-
-            else:
-
-                # --------------------------------------------
-                # ROUND 1
-                # --------------------------------------------
-
-                if (
-                    st.session_state.game_state
-                    == "Round 1"
-                ):
-
-                    st.session_state.round_1_choice = (
-                        current_gesture
-                    )
-
-                    st.session_state.game_state = (
-                        "Round 2"
-                    )
-
-                    st.rerun()
-
-                # --------------------------------------------
-                # ROUND 2
-                # --------------------------------------------
-
-                elif (
-                    st.session_state.game_state
-                    == "Round 2"
-                ):
-
-                    st.session_state.round_2_choice = (
-                        current_gesture
-                    )
-
-                    st.session_state.game_state = (
-                        "Finished"
-                    )
-
-                    st.rerun()
+        if scale < 1.0:
+            img = cv2.resize(img, (w, h))
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-# ============================================================
-# FINAL RESULTS
-# ============================================================
+def lock_round(attr, gesture):
+    st.session_state[attr] = gesture
 
-if st.session_state.game_state == "Finished":
 
-    st.balloons()
+def reset_game():
+    st.session_state.round1 = None
+    st.session_state.round2 = None
 
-    st.markdown(
-        "### 🏆 Game Summary Results"
-    )
 
-    col1, col2 = st.columns(2)
-
-    # ========================================================
-    # ROUND 1 RESULT
-    # ========================================================
-
-    with col1:
-
-        st.metric(
-            label="Round 1 Choice",
-            value=st.session_state.round_1_choice
-        )
-
-    # ========================================================
-    # ROUND 2 RESULT
-    # ========================================================
-
-    with col2:
-
-        st.metric(
-            label="Round 2 Choice",
-            value=st.session_state.round_2_choice
-        )
-
-    # ========================================================
-    # DETERMINE WINNER
-    # ========================================================
-
-    r1 = st.session_state.round_1_choice
-    r2 = st.session_state.round_2_choice
-
+def get_winner(r1, r2):
     if r1 == r2:
+        return "tie"
+    return "round1" if BEATS[r1] == r2 else "round2"
 
-        result_text = (
-            "It's an overall Tie Match! 🤝"
+
+def main():
+    st.set_page_config(page_title="Two-Round Rock-Paper-Scissors", page_icon="✌️", layout="centered")
+    st.title("✌️ Two-Round Rock–Paper–Scissors Vision Game")
+    st.caption("Show your hand to the camera and lock in your throw for each round.")
+
+    if "round1" not in st.session_state:
+        reset_game()
+
+    if not os.path.exists(MODEL_PATH):
+        with st.status("Downloading the MediaPipe hand-landmark model..."):
+            ensure_model()
+
+    with st.expander("How to play"):
+        st.markdown(
+            "- **Rock** - closed fist, all fingers (and thumb) tucked in\n"
+            "- **Paper** - all five fingers spread open\n"
+            "- **Scissors** - strictly only the index and middle fingers extended, thumb tucked\n"
+            "- Lock **Round 1** first, then **Round 2**. Once both rounds are locked, the winner is announced."
         )
 
-    elif (
-        (r1 == "Rock" and r2 == "Scissors")
-        or
-        (r1 == "Scissors" and r2 == "Paper")
-        or
-        (r1 == "Paper" and r2 == "Rock")
-    ):
+    col_camera, col_game = st.columns([7, 5], gap="large")
 
-        result_text = (
-            "🏆 Round 1 Choice Beats "
-            "Round 2 Choice!"
+    with col_camera:
+        st.subheader("Live Camera")
+        ctx = webrtc_streamer(
+            key="rps-vision",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
+            video_processor_factory=RPSVideoProcessor,
+            async_processing=True,
+            sendback_audio=False,
         )
+        current = ctx.video_processor.latest_gesture if ctx.video_processor else None
+        if current:
+            st.metric("Current gesture", f"{GESTURE_EMOJI[current]} {GESTURE_LABEL[current]}")
+        else:
+            st.metric("Current gesture", "-")
 
-    else:
+    with col_game:
+        st.subheader("Rounds")
+        round1 = st.session_state.round1
+        round2 = st.session_state.round2
+        can_lock = current in VALID_GESTURES
 
-        result_text = (
-            "🏆 Round 2 Choice Beats "
-            "Round 1 Choice!"
-        )
+        if round1 is None:
+            st.markdown("### Round 1 :hourglass:")
+            st.caption("Not locked yet")
+            st.button(
+                "Lock Round 1",
+                disabled=not can_lock,
+                on_click=lock_round,
+                args=("round1", current),
+                key="lock_round_1",
+            )
+        else:
+            st.markdown(f"### Round 1 {GESTURE_EMOJI[round1]}")
+            st.caption(f"Locked: **{GESTURE_LABEL[round1]}**")
 
-    st.info(
-        f"**Final Verdict:** {result_text}"
-    )
+        if round1 is None:
+            st.info("Lock Round 1 to enable Round 2.")
+        elif round2 is None:
+            st.markdown("### Round 2 :hourglass:")
+            st.caption("Not locked yet")
+            st.button(
+                "Lock Round 2",
+                disabled=not can_lock,
+                on_click=lock_round,
+                args=("round2", current),
+                key="lock_round_2",
+            )
+        else:
+            st.markdown(f"### Round 2 {GESTURE_EMOJI[round2]}")
+            st.caption(f"Locked: **{GESTURE_LABEL[round2]}**")
 
-    # ========================================================
-    # PLAY AGAIN
-    # ========================================================
+        st.caption("Lock buttons activate when the camera detects a valid rock/paper/scissors gesture.")
 
-    if st.button(
-        "🔄 Play Again",
-        use_container_width=True
-    ):
+        if round1 is not None and round2 is not None:
+            st.divider()
+            st.subheader("Result")
+            winner = get_winner(round1, round2)
+            if winner == "tie":
+                st.success(
+                    f"It's a tie! Both rounds threw {GESTURE_EMOJI[round1]} **{GESTURE_LABEL[round1]}**."
+                )
+            else:
+                winning = round1 if winner == "round1" else round2
+                st.success(
+                    f"**Round {winner[-1]} wins!** {GESTURE_EMOJI[winning]} **{GESTURE_LABEL[winning]}** "
+                    f"beats the other round's throw."
+                )
+            st.button("Play Again", type="primary", on_click=reset_game)
 
-        st.session_state.game_state = "Round 1"
 
-        st.session_state.round_1_choice = None
-
-        st.session_state.round_2_choice = None
-
-        st.rerun()
+if __name__ == "__main__":
+    main()
