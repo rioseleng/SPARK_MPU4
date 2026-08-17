@@ -36,26 +36,28 @@ MODEL_URL = (
 )
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-# STUN + TURN so the WebRTC connection works through NATs and firewalls.
-# Streamlit Community Cloud blocks direct WebRTC packets (see the
-# streamlit-webrtc README), so a TURN relay is required there. Google STUN
-# covers direct connections; Open Relay (metered.ca) is a free public TURN
-# relay used as a fallback. For a more stable setup, replace the relay with
-# a Twilio Network Traversal Service token (https://www.twilio.com/docs/stun-turn).
-RTC_CONFIGURATION = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {
-            "urls": [
-                "turn:openrelay.metered.ca:80",
-                "turn:openrelay.metered.ca:443",
-                "turn:openrelay.metered.ca:443?transport=tcp",
-            ],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        },
-    ]
-}
+# WebRTC on Streamlit Cloud needs a TURN relay because direct UDP packets
+# are blocked. If Twilio credentials exist as Streamlit Cloud secrets
+# (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN), return None so streamlit-webrtc
+# auto-configures Twilio's STUN/TURN servers from them (the reliable option).
+# Otherwise fall back to Google STUN + the free Open Relay TURN server.
+def get_rtc_configuration():
+    if os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"):
+        return None
+    return {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {
+                "urls": [
+                    "turn:openrelay.metered.ca:80",
+                    "turn:openrelay.metered.ca:443",
+                    "turn:openrelay.metered.ca:443?transport=tcp",
+                ],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+        ]
+    }
 
 # Low-ish resolution + front camera: fast on mobile and on Cloud CPUs.
 MEDIA_STREAM_CONSTRAINTS = {
@@ -251,7 +253,7 @@ def main():
         ctx = webrtc_streamer(
             key="rps-vision",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration=get_rtc_configuration(),
             media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
             video_processor_factory=RPSVideoProcessor,
             async_processing=True,
@@ -262,6 +264,17 @@ def main():
             st.metric("Current gesture", f"{GESTURE_EMOJI[current]} {GESTURE_LABEL[current]}")
         else:
             st.metric("Current gesture", "-")
+        with st.expander("Troubleshooting: camera connection"):
+            st.markdown(
+                "- Allow camera access when the browser asks for it.\n"
+                "- The app streams video over WebRTC; Streamlit Cloud blocks direct "
+                "connections, so a TURN relay is required.\n"
+                "- For a reliable connection, create a free Twilio trial account "
+                "(twilio.com) and add `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` "
+                "as Streamlit Cloud secrets (Settings > Secrets). The app detects "
+                "them automatically.\n"
+                "- On your own machine (`streamlit run app.py`) no TURN is needed."
+            )
 
     with col_game:
         st.subheader("Rounds")
