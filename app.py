@@ -36,8 +36,26 @@ MODEL_URL = (
 )
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-# STUN server so the WebRTC connection works on mobile networks / NATs.
-RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+# STUN + TURN so the WebRTC connection works through NATs and firewalls.
+# Streamlit Community Cloud blocks direct WebRTC packets (see the
+# streamlit-webrtc README), so a TURN relay is required there. Google STUN
+# covers direct connections; Open Relay (metered.ca) is a free public TURN
+# relay used as a fallback. For a more stable setup, replace the relay with
+# a Twilio Network Traversal Service token (https://www.twilio.com/docs/stun-turn).
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {
+            "urls": [
+                "turn:openrelay.metered.ca:80",
+                "turn:openrelay.metered.ca:443",
+                "turn:openrelay.metered.ca:443?transport=tcp",
+            ],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
+}
 
 # Low-ish resolution + front camera: fast on mobile and on Cloud CPUs.
 MEDIA_STREAM_CONSTRAINTS = {
