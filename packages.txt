@@ -1,5 +1,8 @@
 libgl1
-libglib2.0-0
+# Streamlit Cloud's runtime is Debian trixie-based; glib is packaged there as
+# libglib2.0-0t64 (the transitional "libglib2.0-0" name resolves to a broken
+# bullseye build that depends on unavailable libffi7/libpcre3).
+libglib2.0-0t64
 libgomp1
 libsm6
 libxext6
