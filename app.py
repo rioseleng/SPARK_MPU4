@@ -1,8 +1,13 @@
 import streamlit as st
 import cv2
 import mediapipe as mp
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
+
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    RTCConfiguration
+)
 
 
 # ============================================================
@@ -15,10 +20,16 @@ st.set_page_config(
     layout="centered"
 )
 
+
+# ============================================================
+# TITLE
+# ============================================================
+
 st.title("🤖 Two-Round RPS Vision Game")
+
 st.write(
-    "Play two consecutive rounds against yourself or a friend, "
-    "analyzed using computer vision."
+    "Play two consecutive rounds of Rock-Paper-Scissors "
+    "using computer vision."
 )
 
 
@@ -26,19 +37,6 @@ st.write(
 # MEDIAPIPE INITIALIZATION
 # ============================================================
 
-import sys
-import streamlit as st
-import mediapipe as mp
-
-st.write("Python version:", sys.version)
-st.write("MediaPipe version:", getattr(mp, "__version__", "unknown"))
-st.write("MediaPipe path:", mp.__file__)
-st.write("Has mp.solutions:", hasattr(mp, "solutions"))
-
-if not hasattr(mp, "solutions"):
-    st.error("The deployed MediaPipe version does not provide mp.solutions.")
-    st.stop()
-    
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
@@ -51,30 +49,30 @@ hands = mp_hands.Hands(
 
 
 # ============================================================
-# GESTURE RECOGNITION
+# GESTURE CLASSIFICATION
 # ============================================================
 
 def classify_gesture(frame):
-    """
-    Detects a hand and classifies it as:
-    Rock, Paper, Scissors, Invalid, or Unknown.
 
-    Returns:
-        processed_frame
-        gesture
-        alert_message
-    """
-
-    # Convert BGR -> RGB for MediaPipe
+    # Convert BGR to RGB
     rgb_frame = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
+    # Process frame with MediaPipe
     results = hands.process(rgb_frame)
 
     gesture = "Unknown"
-    alert = "⚠️ No hand detected! Please show your hand to the camera."
+
+    alert = (
+        "⚠️ No hand detected! "
+        "Please show your hand to the camera."
+    )
+
+    # ========================================================
+    # HAND DETECTED
+    # ========================================================
 
     if results.multi_hand_landmarks:
 
@@ -82,7 +80,7 @@ def classify_gesture(frame):
 
         for hand_landmarks in results.multi_hand_landmarks:
 
-            # Draw hand landmarks
+            # Draw hand skeleton
             mp_draw.draw_landmarks(
                 frame,
                 hand_landmarks,
@@ -91,23 +89,32 @@ def classify_gesture(frame):
 
             landmarks = hand_landmarks.landmark
 
-            # ------------------------------------------------
-            # Detect fingers
-            # ------------------------------------------------
+            # =================================================
+            # FINGER DETECTION
+            # =================================================
 
             fingers = []
 
+            # -------------------------------------------------
             # Thumb
+            # -------------------------------------------------
+
             if landmarks[4].x < landmarks[3].x:
                 fingers.append(1)
             else:
                 fingers.append(0)
 
-            # Index, Middle, Ring, Pinky
+            # -------------------------------------------------
+            # Other four fingers
+            # -------------------------------------------------
+
             finger_tips = [8, 12, 16, 20]
             finger_pips = [6, 10, 14, 18]
 
-            for tip, pip in zip(finger_tips, finger_pips):
+            for tip, pip in zip(
+                finger_tips,
+                finger_pips
+            ):
 
                 if landmarks[tip].y < landmarks[pip].y:
                     fingers.append(1)
@@ -116,13 +123,17 @@ def classify_gesture(frame):
 
             total_fingers = sum(fingers)
 
-            # ------------------------------------------------
-            # Gesture classification
-            # ------------------------------------------------
+            # =================================================
+            # ROCK
+            # =================================================
 
             if total_fingers == 0 or total_fingers == 1:
 
                 gesture = "Rock"
+
+            # =================================================
+            # SCISSORS
+            # =================================================
 
             elif (
                 total_fingers == 2
@@ -132,9 +143,17 @@ def classify_gesture(frame):
 
                 gesture = "Scissors"
 
+            # =================================================
+            # PAPER
+            # =================================================
+
             elif total_fingers == 5:
 
                 gesture = "Paper"
+
+            # =================================================
+            # INVALID
+            # =================================================
 
             else:
 
@@ -155,7 +174,9 @@ def classify_gesture(frame):
 class VideoProcessor:
 
     def __init__(self):
+
         self.gesture = "Unknown"
+
         self.alert = (
             "⚠️ No hand detected! "
             "Please show your hand to the camera."
@@ -163,17 +184,21 @@ class VideoProcessor:
 
     def recv(self, frame):
 
-        # Convert WebRTC frame to OpenCV format
-        img = frame.to_ndarray(format="bgr24")
+        # Convert WebRTC frame to OpenCV image
+        img = frame.to_ndarray(
+            format="bgr24"
+        )
 
         # Analyze gesture
-        processed_img, gesture, alert = classify_gesture(img)
+        processed_img, gesture, alert = (
+            classify_gesture(img)
+        )
 
         # Save latest detection
         self.gesture = gesture
         self.alert = alert
 
-        # Return processed frame
+        # Return processed video frame
         return av.VideoFrame.from_ndarray(
             processed_img,
             format="bgr24"
@@ -185,12 +210,17 @@ class VideoProcessor:
 # ============================================================
 
 if "game_state" not in st.session_state:
+
     st.session_state.game_state = "Round 1"
 
+
 if "round_1_choice" not in st.session_state:
+
     st.session_state.round_1_choice = None
 
+
 if "round_2_choice" not in st.session_state:
+
     st.session_state.round_2_choice = None
 
 
@@ -204,18 +234,22 @@ st.subheader(
 
 
 # ============================================================
-# ROUND 1 / ROUND 2
+# GAME ROUNDS
 # ============================================================
 
-if st.session_state.game_state in ["Round 1", "Round 2"]:
+if st.session_state.game_state in [
+    "Round 1",
+    "Round 2"
+]:
 
     st.info(
-        f"Show your hand for {st.session_state.game_state}."
+        f"Show your hand for "
+        f"**{st.session_state.game_state}**."
     )
 
-    # --------------------------------------------------------
-    # WebRTC configuration
-    # --------------------------------------------------------
+    # ========================================================
+    # WEBRTC CONFIGURATION
+    # ========================================================
 
     rtc_config = RTCConfiguration(
         {
@@ -229,9 +263,9 @@ if st.session_state.game_state in ["Round 1", "Round 2"]:
         }
     )
 
-    # --------------------------------------------------------
-    # Start WebRTC
-    # --------------------------------------------------------
+    # ========================================================
+    # START CAMERA
+    # ========================================================
 
     ctx = webrtc_streamer(
         key="rps-stream",
@@ -249,14 +283,23 @@ if st.session_state.game_state in ["Round 1", "Round 2"]:
         }
     )
 
-    # --------------------------------------------------------
-    # Display current detection
-    # --------------------------------------------------------
+    # ========================================================
+    # SHOW DETECTION
+    # ========================================================
 
     if ctx.video_processor:
 
-        current_gesture = ctx.video_processor.gesture
-        alert_msg = ctx.video_processor.alert
+        current_gesture = (
+            ctx.video_processor.gesture
+        )
+
+        alert_msg = (
+            ctx.video_processor.alert
+        )
+
+        # ----------------------------------------------------
+        # Valid gesture
+        # ----------------------------------------------------
 
         if current_gesture in [
             "Rock",
@@ -265,20 +308,29 @@ if st.session_state.game_state in ["Round 1", "Round 2"]:
         ]:
 
             st.success(
-                f"Detected Gesture: **{current_gesture}**"
+                f"Detected Gesture: "
+                f"**{current_gesture}**"
             )
+
+        # ----------------------------------------------------
+        # Invalid gesture
+        # ----------------------------------------------------
 
         elif current_gesture == "Invalid":
 
             st.warning(alert_msg)
 
+        # ----------------------------------------------------
+        # No hand
+        # ----------------------------------------------------
+
         else:
 
             st.error(alert_msg)
 
-        # ----------------------------------------------------
-        # Lock gesture
-        # ----------------------------------------------------
+        # ====================================================
+        # LOCK GESTURE
+        # ====================================================
 
         if st.button(
             "🔒 Lock Input Gesture",
@@ -297,23 +349,41 @@ if st.session_state.game_state in ["Round 1", "Round 2"]:
 
             else:
 
-                if st.session_state.game_state == "Round 1":
+                # --------------------------------------------
+                # ROUND 1
+                # --------------------------------------------
+
+                if (
+                    st.session_state.game_state
+                    == "Round 1"
+                ):
 
                     st.session_state.round_1_choice = (
                         current_gesture
                     )
 
-                    st.session_state.game_state = "Round 2"
+                    st.session_state.game_state = (
+                        "Round 2"
+                    )
 
                     st.rerun()
 
-                elif st.session_state.game_state == "Round 2":
+                # --------------------------------------------
+                # ROUND 2
+                # --------------------------------------------
+
+                elif (
+                    st.session_state.game_state
+                    == "Round 2"
+                ):
 
                     st.session_state.round_2_choice = (
                         current_gesture
                     )
 
-                    st.session_state.game_state = "Finished"
+                    st.session_state.game_state = (
+                        "Finished"
+                    )
 
                     st.rerun()
 
@@ -326,9 +396,15 @@ if st.session_state.game_state == "Finished":
 
     st.balloons()
 
-    st.markdown("### 🏆 Game Summary Results")
+    st.markdown(
+        "### 🏆 Game Summary Results"
+    )
 
     col1, col2 = st.columns(2)
+
+    # ========================================================
+    # ROUND 1 RESULT
+    # ========================================================
 
     with col1:
 
@@ -337,6 +413,10 @@ if st.session_state.game_state == "Finished":
             value=st.session_state.round_1_choice
         )
 
+    # ========================================================
+    # ROUND 2 RESULT
+    # ========================================================
+
     with col2:
 
         st.metric(
@@ -344,9 +424,9 @@ if st.session_state.game_state == "Finished":
             value=st.session_state.round_2_choice
         )
 
-    # --------------------------------------------------------
-    # Determine winner
-    # --------------------------------------------------------
+    # ========================================================
+    # DETERMINE WINNER
+    # ========================================================
 
     r1 = st.session_state.round_1_choice
     r2 = st.session_state.round_2_choice
@@ -366,22 +446,24 @@ if st.session_state.game_state == "Finished":
     ):
 
         result_text = (
-            "🏆 Round 1 Choice Beats Round 2 Choice!"
+            "🏆 Round 1 Choice Beats "
+            "Round 2 Choice!"
         )
 
     else:
 
         result_text = (
-            "🏆 Round 2 Choice Beats Round 1 Choice!"
+            "🏆 Round 2 Choice Beats "
+            "Round 1 Choice!"
         )
 
     st.info(
         f"**Final Verdict:** {result_text}"
     )
 
-    # --------------------------------------------------------
-    # Play again
-    # --------------------------------------------------------
+    # ========================================================
+    # PLAY AGAIN
+    # ========================================================
 
     if st.button(
         "🔄 Play Again",
@@ -389,7 +471,9 @@ if st.session_state.game_state == "Finished":
     ):
 
         st.session_state.game_state = "Round 1"
+
         st.session_state.round_1_choice = None
+
         st.session_state.round_2_choice = None
 
         st.rerun()
