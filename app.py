@@ -26,6 +26,19 @@ st.write(
 # MEDIAPIPE INITIALIZATION
 # ============================================================
 
+import sys
+import streamlit as st
+import mediapipe as mp
+
+st.write("Python version:", sys.version)
+st.write("MediaPipe version:", getattr(mp, "__version__", "unknown"))
+st.write("MediaPipe path:", mp.__file__)
+st.write("Has mp.solutions:", hasattr(mp, "solutions"))
+
+if not hasattr(mp, "solutions"):
+    st.error("The deployed MediaPipe version does not provide mp.solutions.")
+    st.stop()
+    
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
