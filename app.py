@@ -9,9 +9,9 @@ Deploy on Streamlit Community Cloud
 1. Commit app.py, hand_landmarker.task, requirements.txt and packages.txt.
 2. In Streamlit Cloud, create a new app from the GitHub repo and choose a
    Python version >= 3.10 (3.11 or 3.12 recommended).
-3. packages.txt installs the apt libraries (libGL, glib, libgomp, ...) that
-   OpenCV/MediaPipe need on the Linux runtime, so no system-dependency
-   errors occur.
+3. requirements.txt uses opencv-python-headless, so OpenCV needs no GUI
+   system libraries on the server. packages.txt installs libgomp1 (MediaPipe's
+   OpenMP runtime) plus the classic libGL/glib fallback libraries.
 4. If hand_landmarker.task is not committed to the repo, the app downloads
    it automatically on first run, so the repo works either way.
 """

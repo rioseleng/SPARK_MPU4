@@ -2,5 +2,9 @@ streamlit>=1.51.0
 streamlit-webrtc>=0.77.0
 av>=15.1.0
 mediapipe==1.0.1
-opencv-contrib-python>=4.10.0.84
+# mediapipe depends on opencv-contrib-python (GUI build) which needs apt
+# libraries (libGL, libgthread, ...) on the server. opencv-python-headless
+# provides the same cv2 module without any GUI dependency. Keep it listed
+# AFTER mediapipe so its files overwrite the contrib build on install.
+opencv-python-headless>=4.10.0.84
 numpy>=1.26.0
